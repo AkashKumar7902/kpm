@@ -1131,6 +1131,7 @@ func (c *KpmClient) downloadDeps(deps pkg.Dependencies, lockDeps pkg.Dependencie
 
 	// Traverse all dependencies in kcl.mod
 	for _, d := range deps.Deps {
+		depGraphs[i] = graph.New(graph.StringHash, graph.Directed())
 		depGraphs[i].AddVertex(fmt.Sprintf("%s@%s", d.Name, d.Version))
 		i++
 		if len(d.Name) == 0 {
