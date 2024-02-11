@@ -1194,13 +1194,6 @@ func (c *KpmClient) downloadDeps(deps pkg.Dependencies, lockDeps pkg.Dependencie
 
 	depGraph := graph.New(graph.StringHash, graph.Directed())
 
-	for _, d := range newDeps.Deps {
-		err := depGraph.AddVertex(fmt.Sprintf("%s@%s", d.Name, d.Version))
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
 	// Recursively download the dependencies of the new dependencies.
 	for _, d := range newDeps.Deps {
 		// Load kcl.mod file of the new downloaded dependencies.
@@ -1223,6 +1216,13 @@ func (c *KpmClient) downloadDeps(deps pkg.Dependencies, lockDeps pkg.Dependencie
 		}
 
 		source := fmt.Sprintf("%s@%s", d.Name, d.Version)
+		err = depGraph.AddVertex(source)
+		if err != nil {
+			if err != graph.ErrVertexAlreadyExists {
+				return nil, nil, err
+			}
+		}
+
 		sourcesOfNestedDepGraph, err := FindSource(nestedDepGraph)
 		if err != nil {
 			return nil, nil, err
