@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/dominikbraun/graph"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/otiai10/copy"
 	"kcl-lang.io/kcl-go/pkg/kcl"
@@ -567,7 +568,7 @@ func (c *KpmClient) AddDepToPkg(kclPkg *pkg.KclPkg, d *pkg.Dependency) error {
 	}
 
 	// download all the dependencies.
-	changedDeps, err := c.downloadDeps(kclPkg.ModFile.Dependencies, kclPkg.Dependencies)
+	changedDeps, _, err := c.downloadDeps(kclPkg.ModFile.Dependencies, kclPkg.Dependencies)
 
 	if err != nil {
 		return err
@@ -1068,6 +1069,55 @@ func (c *KpmClient) ParseOciOptionFromString(oci string, tag string) (*opt.OciOp
 	return ociOpt, nil
 }
 
+// PrintDependencyGraph will print the dependency graph of kcl package dependencies
+func (c *KpmClient) PrintDependencyGraph(kclPkg *pkg.KclPkg) error {
+	_, depGraph, err := c.downloadDeps(kclPkg.Dependencies, kclPkg.ModFile.Dependencies)
+	if err != nil {
+		return err
+	}
+
+	// add the root vertex(package name) to the dependency graph.
+	root := fmt.Sprint(kclPkg.GetPkgName()) 
+	err = depGraph.AddVertex(root)
+	if err != nil {
+		return err
+	}
+
+	sources, err := FindSource(depGraph)
+	if err != nil {
+		return err
+	}
+
+	// make an edge between the root vertex and all the sources of the dependency graph.
+	for _, source := range sources {
+		err = depGraph.AddEdge(source, root)
+		if err != nil {
+			return err
+		}
+	}
+
+	adjMap, err := depGraph.AdjacencyMap()
+	if err != nil {
+		return err
+	}
+
+	// print the dependency graph to stdout.
+	err = graph.BFS(depGraph, root, func(source string) bool {
+		for target := range adjMap[source] {
+			reporter.ReportMsgTo(
+				fmt.Sprint(source, target),
+				c.logWriter,
+			)
+		}
+		return false
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // dependencyExists will check whether the dependency exists in the local filesystem.
 func (c *KpmClient) dependencyExists(dep *pkg.Dependency, lockDeps *pkg.Dependencies) *pkg.Dependency {
 
@@ -1080,7 +1130,7 @@ func (c *KpmClient) dependencyExists(dep *pkg.Dependency, lockDeps *pkg.Dependen
 	}
 
 	lockDep, present := lockDeps.Deps[dep.Name]
-	// Check if the sum of this dependency in kcl.mod.lock has been chanaged.
+	// Check if the sum of this dependency in kcl.mod.lock has been changed.
 	if !c.noSumCheck && present {
 		// If the dependent package does not exist locally, then method 'check' will return false.
 		if c.noSumCheck || check(lockDep, filepath.Join(c.homePath, dep.FullName)) {
@@ -1092,7 +1142,7 @@ func (c *KpmClient) dependencyExists(dep *pkg.Dependency, lockDeps *pkg.Dependen
 }
 
 // downloadDeps will download all the dependencies of the current kcl package.
-func (c *KpmClient) downloadDeps(deps pkg.Dependencies, lockDeps pkg.Dependencies) (*pkg.Dependencies, error) {
+func (c *KpmClient) downloadDeps(deps pkg.Dependencies, lockDeps pkg.Dependencies) (*pkg.Dependencies, graph.Graph[string, string], error) {
 	newDeps := pkg.Dependencies{
 		Deps: make(map[string]pkg.Dependency),
 	}
@@ -1100,7 +1150,7 @@ func (c *KpmClient) downloadDeps(deps pkg.Dependencies, lockDeps pkg.Dependencie
 	// Traverse all dependencies in kcl.mod
 	for _, d := range deps.Deps {
 		if len(d.Name) == 0 {
-			return nil, errors.InvalidDependency
+			return nil, nil, errors.InvalidDependency
 		}
 
 		existDep := c.dependencyExists(&d, &lockDeps)
@@ -1112,7 +1162,7 @@ func (c *KpmClient) downloadDeps(deps pkg.Dependencies, lockDeps pkg.Dependencie
 		expectedSum := lockDeps.Deps[d.Name].Sum
 		// Clean the cache
 		if len(c.homePath) == 0 || len(d.FullName) == 0 {
-			return nil, errors.InternalBug
+			return nil, nil, errors.InternalBug
 		}
 		dir := filepath.Join(c.homePath, d.FullName)
 		os.RemoveAll(dir)
@@ -1121,7 +1171,7 @@ func (c *KpmClient) downloadDeps(deps pkg.Dependencies, lockDeps pkg.Dependencie
 
 		lockedDep, err := c.Download(&d, dir)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		if !lockedDep.IsFromLocal() {
@@ -1129,7 +1179,7 @@ func (c *KpmClient) downloadDeps(deps pkg.Dependencies, lockDeps pkg.Dependencie
 				lockedDep.Sum != expectedSum &&
 				existDep != nil &&
 				existDep.FullName == d.FullName {
-				return nil, reporter.NewErrorEvent(
+				return nil, nil, reporter.NewErrorEvent(
 					reporter.CheckSumMismatch,
 					errors.CheckSumMismatchError,
 					fmt.Sprintf("checksum for '%s' changed in lock file", lockedDep.Name),
@@ -1141,6 +1191,8 @@ func (c *KpmClient) downloadDeps(deps pkg.Dependencies, lockDeps pkg.Dependencie
 		newDeps.Deps[d.Name] = *lockedDep
 		lockDeps.Deps[d.Name] = *lockedDep
 	}
+
+	depGraph := graph.New(graph.StringHash, graph.Directed())
 
 	// Recursively download the dependencies of the new dependencies.
 	for _, d := range newDeps.Deps {
@@ -1154,13 +1206,37 @@ func (c *KpmClient) downloadDeps(deps pkg.Dependencies, lockDeps pkg.Dependencie
 			if os.IsNotExist(err) {
 				continue
 			}
-			return nil, err
+			return nil, nil, err
 		}
 
 		// Download the dependencies.
-		nested, err := c.downloadDeps(deppkg.ModFile.Dependencies, lockDeps)
+		nested, nestedDepGraph, err := c.downloadDeps(deppkg.ModFile.Dependencies, lockDeps)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
+		}
+
+		source := fmt.Sprintf("%s@%s", d.Name, d.Version)
+		err = depGraph.AddVertex(source)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		sourcesOfNestedDepGraph, err := FindSource(nestedDepGraph)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		depGraph, err = Union(depGraph, nestedDepGraph)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// make an edge between the source of all nested dep graph and main dep graph 
+		for _, sourceOfNestedDepGraph := range sourcesOfNestedDepGraph {
+			err = depGraph.AddEdge(source, sourceOfNestedDepGraph)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
 
 		// Update kcl.mod.
@@ -1171,7 +1247,7 @@ func (c *KpmClient) downloadDeps(deps pkg.Dependencies, lockDeps pkg.Dependencie
 		}
 	}
 
-	return &newDeps, nil
+	return &newDeps, depGraph, nil
 }
 
 // pullTarFromOci will pull a kcl package tar file from oci registry.
@@ -1243,4 +1319,81 @@ func check(dep pkg.Dependency, newDepPath string) bool {
 	}
 
 	return dep.Sum == sum
+}
+
+func FindSource[K comparable, T any](g graph.Graph[K, T]) ([]K, error) {
+	if !g.Traits().IsDirected {
+		return nil, fmt.Errorf("cannot find source of a non-DAG graph ")
+	}
+
+	predecessorMap, err := g.PredecessorMap()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get predecessor map: %w", err)
+	}
+
+	var sources []K
+	for vertex, predecessors := range predecessorMap {
+		if len(predecessors) == 0 {
+			sources = append(sources, vertex)
+		}
+	}
+	return sources, nil
+}
+
+// Union combines two given graphs into a new graph. The vertex hashes in both
+// graphs are expected to be unique. The two input graphs will remain unchanged.
+//
+// Both graphs should be either directed or undirected. All traits for the new
+// graph will be derived from g.
+// 
+// If the same vertex happens to be in both g and h, then an error will not be 
+// thrown as happens in original Union function and successful operation takes place.
+func Union[K comparable, T any](g, h graph.Graph[K, T]) (graph.Graph[K, T], error) {
+	union, err := g.Clone()
+	if err != nil {
+		return union, fmt.Errorf("failed to clone g: %w", err)
+	}
+
+	adjacencyMap, err := h.AdjacencyMap()
+	if err != nil {
+		return union, fmt.Errorf("failed to get adjacency map: %w", err)
+	}
+
+	addedEdges := make(map[K]map[K]struct{})
+
+	for currentHash := range adjacencyMap {
+		vertex, err := h.Vertex(currentHash)
+		if err != nil {
+			return union, fmt.Errorf("failed to get vertex %v: %w", currentHash, err)
+		}
+
+		err = union.AddVertex(vertex)
+		if err != nil {
+			return union, fmt.Errorf("failed to add vertex %v: %w", currentHash, err)
+		}
+	}
+
+	for _, adjacencies := range adjacencyMap {
+		for _, edge := range adjacencies {
+			if _, sourceOK := addedEdges[edge.Source]; sourceOK {
+				if _, targetOK := addedEdges[edge.Source][edge.Target]; targetOK {
+					// If the edge addedEdges[source][target] exists, the edge
+					// has already been created and thus can be skipped here.
+					continue
+				}
+			}
+
+			err = union.AddEdge(edge.Source, edge.Target)
+			if err != nil && err != graph.ErrEdgeAlreadyExists {
+				return union, fmt.Errorf("failed to add edge (%v, %v): %w", edge.Source, edge.Target, err)
+			}
+
+			if _, ok := addedEdges[edge.Source]; !ok {
+				addedEdges[edge.Source] = make(map[K]struct{})
+			}
+			addedEdges[edge.Source][edge.Target] = struct{}{}
+		}
+	}
+
+	return union, nil
 }
